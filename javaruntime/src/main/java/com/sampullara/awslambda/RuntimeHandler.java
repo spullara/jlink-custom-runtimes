@@ -11,18 +11,22 @@ import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
 import com.amazonaws.services.lambda.runtime.events.KinesisEvent;
 import com.amazonaws.services.lambda.runtime.events.S3Event;
 import com.amazonaws.services.lambda.runtime.events.SNSEvent;
-import com.fasterxml.jackson.core.JsonEncoding;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MappingJsonFactory;
 
 import java.io.IOException;
-import java.io.OutputStream;
+import java.io.StringWriter;
 import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.Arrays;
+
+import static java.net.http.HttpResponse.BodyHandlers;
 
 /**
  * Custom runtime handler for executing Java 11 applications
@@ -30,7 +34,12 @@ import java.util.Arrays;
 public class RuntimeHandler {
   private final static MappingJsonFactory mjf = new MappingJsonFactory();
 
-  public static void main(String[] args) throws IOException {
+  private final static HttpClient hc = HttpClient.newBuilder()
+          .followRedirects(HttpClient.Redirect.NEVER)
+          .connectTimeout(Duration.ofSeconds(10))
+          .build();
+
+  public static void main(String[] args) throws IOException, InterruptedException {
     String runtimeApi = System.getenv("AWS_LAMBDA_RUNTIME_API");
     String base = "http://" + runtimeApi + "/2018-06-01/runtime/";
     String invocationBase = base + "invocation/";
@@ -67,17 +76,17 @@ public class RuntimeHandler {
 
       //noinspection InfiniteLoopStatement
       while (true) {
-        URL nextUrl = new URL(next);
-        HttpURLConnection nextUrlc = (HttpURLConnection) nextUrl.openConnection();
-        nextUrlc.setDoInput(true);
-        String requestId = nextUrlc.getHeaderField("Lambda-Runtime-Aws-Request-Id");
-        String deadlineMs = nextUrlc.getHeaderField("Lambda-Runtime-Deadline-Ms");
-        String functionArn = nextUrlc.getHeaderField("Lambda-Runtime-Invoked-Function-Arn");
-        String traceId = nextUrlc.getHeaderField("Lambda-Runtime-Trace-Id");
-        System.setProperty("_X_AMZN_TRACE_ID", traceId);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(next)).GET().build();
+        HttpResponse<String> hr = hc.send(request, BodyHandlers.ofString());
+        HttpHeaders headers = hr.headers();
+        String requestId = headers.firstValue("Lambda-Runtime-Aws-Request-Id").orElseThrow();
+        String deadlineMs = headers.firstValue("Lambda-Runtime-Deadline-Ms").orElseThrow();
+        String functionArn = headers.firstValue("Lambda-Runtime-Invoked-Function-Arn").orElseThrow();
+        headers.firstValue("Lambda-Runtime-Trace-Id")
+                .ifPresent(traceId -> System.setProperty("_X_AMZN_TRACE_ID", traceId));
         try {
-          String value = new String(nextUrlc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-          boolean isJson = nextUrlc.getContentType().contains("json");
+          String value = hr.body();
+          boolean isJson = headers.firstValue("Content-Type").orElseThrow().contains("json");
           Object[] parameters = new Object[method.getParameterCount()];
           Class<?> firstParameterType = method.getParameterTypes()[0];
           setContext(requestId, deadlineMs, functionArn, parameters, firstParameterType);
@@ -97,7 +106,7 @@ public class RuntimeHandler {
                 break;
               case "java.lang.Float":
               case "float":
-                parameters[0] = isJson ? ((float)node(value).asDouble()) : Float.parseFloat(value);
+                parameters[0] = isJson ? ((float) node(value).asDouble()) : Float.parseFloat(value);
                 break;
               case "java.lang.Double":
               case "double":
@@ -134,31 +143,28 @@ public class RuntimeHandler {
           // Invoke the lambda request handler
           Object invoked = method.invoke(handler, parameters);
 
-          // Construct response
-          URL responseUrl = new URL(invocationBase + requestId + "/response");
-          HttpURLConnection responseUrlc = (HttpURLConnection) responseUrl.openConnection();
-          responseUrlc.setDoOutput(true);
-
-          // Not sure what this should be yet
-          responseUrlc.addRequestProperty("Content-Type", "application/json");
-
-          // Write the output and complete the request
-          OutputStream os = responseUrlc.getOutputStream();
-          JsonGenerator g = mjf.createGenerator(os, JsonEncoding.UTF8);
+          // Generate the serialized version of the result
+          StringWriter sw = new StringWriter();
+          JsonGenerator g = mjf.createGenerator(sw);
           g.writeObject(invoked);
           g.flush();
-          os.close();
-          responseUrlc.getResponseCode();
+
+          // Construct response
+          HttpRequest responsePost = HttpRequest.newBuilder(URI.create(invocationBase + requestId + "/response"))
+                  .POST(HttpRequest.BodyPublishers.ofString(sw.toString()))
+                  .header("Content-Type", "application/json")
+                  .build();
+          hc.send(responsePost, BodyHandlers.discarding());
         } catch (Throwable e) {
           e.printStackTrace();
           // Normal error from execution
-          sendError(e, new URL(invocationBase + requestId + "/error"));
+          sendError(e, URI.create(invocationBase + requestId + "/error"));
         }
       }
     } catch (Throwable e) {
       e.printStackTrace();
       // Initialization error
-      sendError(e, new URL(base + "init/error"));
+      sendError(e, URI.create(base + "init/error"));
     }
   }
 
@@ -228,20 +234,20 @@ public class RuntimeHandler {
   }
 
   private static JsonNode node(String value) throws IOException {
-    return (JsonNode)mjf.createParser(value).readValueAsTree();
+    return (JsonNode) mjf.createParser(value).readValueAsTree();
   }
 
-  private static void sendError(Throwable e, URL errorUrl) throws IOException {
-    HttpURLConnection errorUrlc = (HttpURLConnection) errorUrl.openConnection();
-    errorUrlc.setDoOutput(true);
-    OutputStream os = errorUrlc.getOutputStream();
-    JsonGenerator g = mjf.createGenerator(os, JsonEncoding.UTF8);
+  private static void sendError(Throwable e, URI errorUrl) throws IOException, InterruptedException {
+    StringWriter sw = new StringWriter();
+    JsonGenerator g = mjf.createGenerator(sw);
     g.writeStartObject();
     g.writeStringField("errorMessage", e.getMessage());
     g.writeStringField("errorType", e.getClass().getSimpleName());
     g.writeEndObject();
     g.flush();
-    os.close();
-    errorUrlc.getResponseCode();
+
+    HttpRequest errorRequest = HttpRequest.newBuilder(errorUrl)
+            .POST(HttpRequest.BodyPublishers.ofString(sw.toString())).build();
+    hc.send(errorRequest, BodyHandlers.discarding());
   }
 }
